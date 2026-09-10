@@ -1,0 +1,86 @@
+# TermChat - zero-install PowerShell client (no Node.js needed).
+# Run it with:    iex (irm https://tchat.space-z.ai/p)
+# Join a room:    $env:TCHAT_ROOM='7XK92'; iex (irm https://tchat.space-z.ai/p)
+# Works on Windows PowerShell 5.1+ and PowerShell 7+. Uses built-in curl.exe.
+# Override host:  $env:TCHAT_URL='http://localhost:3000' before running.
+# Note: incoming messages print live; if one arrives mid-typing just keep going and press Enter.
+
+$ErrorActionPreference = 'Stop'
+$B = if ($env:TCHAT_URL) { $env:TCHAT_URL } else { 'https://tchat.space-z.ai' }
+$R = if ($env:TCHAT_ROOM) { $env:TCHAT_ROOM } else { 'lobby' }
+$curlExe = $null
+foreach ($c in @('curl.exe', 'curl')) {
+    $cmd = Get-Command $c -ErrorAction SilentlyContinue
+    if ($cmd -and $cmd.CommandType -eq 'Application') { $curlExe = $cmd.Source; break }
+}
+if (-not $curlExe) {
+    Write-Host 'termchat: curl is required (built into Windows 10 1803+)'
+    return
+}
+
+$n = Read-Host 'guest name'
+if ($n -notmatch '^[A-Za-z0-9][A-Za-z0-9 ._-]{1,19}$') {
+    Write-Host 'termchat: name must be 2-20 chars - letters, digits, spaces, _ . -'
+    return
+}
+$enc = [uri]::EscapeDataString($n)
+$renc = [uri]::EscapeDataString($R)
+$send = "$B/send?XTransformPort=3004"
+
+# ---- receiver runspace: streams the room feed and prints it live ----
+$ps = [powershell]::Create()
+$ps.AddScript({
+    param($url, $exe)
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $exe
+    $psi.Arguments = '-Ns --max-time 86400 "' + $url + '"'
+    $psi.RedirectStandardOutput = $true
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $p = [System.Diagnostics.Process]::Start($psi)
+    $out = $p.StandardOutput
+    while ($null -ne ($line = $out.ReadLine())) {
+        if ($line.StartsWith('data:')) {
+            $t = $line.Substring(5)
+            if ($t.Length -gt 0) { Write-Host $t }
+        }
+    }
+    Write-Host '*** disconnected - bye!'
+}).AddArgument("$B/stream?XTransformPort=3004&name=$enc&room=$renc").AddArgument($curlExe) | Out-Null
+$handle = $ps.BeginInvoke()
+
+# ---- sender: non-blocking console input on this thread ----
+$sb = New-Object System.Text.StringBuilder
+Write-Host 'you > ' -NoNewline
+try {
+    while ($true) {
+        if ([Console]::KeyAvailable) {
+            $k = [Console]::ReadKey($true)
+            if ($k.Key -eq 'Enter') {
+                $msg = $sb.ToString(); [void]$sb.Clear(); Write-Host ''
+                if ($msg -in '/quit', '/exit', '/q') { break }
+                if ($msg) {
+                    try {
+                        Invoke-RestMethod -Method Post -Uri $send -Body @{ name = $n; text = $msg; room = $R } | Out-Null
+                    } catch {
+                        Write-Host "send failed: $($_.Exception.Message)"
+                    }
+                }
+                Write-Host 'you > ' -NoNewline
+            }
+            elseif ($k.Key -eq 'Backspace') {
+                if ($sb.Length -gt 0) { [void]$sb.Remove($sb.Length - 1, 1); Write-Host "`b `b" -NoNewline }
+            }
+            elseif ($k.Key -eq 'C' -and ($k.Modifiers -band [System.ConsoleModifiers]::Control)) { break }
+            elseif ($k.KeyChar -and -not [char]::IsControl($k.KeyChar)) {
+                [void]$sb.Append($k.KeyChar); Write-Host $k.KeyChar -NoNewline
+            }
+        }
+        else { Start-Sleep -Milliseconds 60 }
+    }
+}
+finally {
+    try { Invoke-RestMethod -Method Post -Uri $send -Body @{ name = $n; text = '/quit'; room = $R } | Out-Null } catch {}
+    try { $ps.Stop(); $ps.Dispose() } catch {}
+    Write-Host 'bye!'
+}

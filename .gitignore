@@ -1,0 +1,40 @@
+# dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# builds
+.next/
+out/
+build/
+dist/
+.build/
+*.tsbuildinfo
+next-env.d.ts
+
+# native client artifacts (built via scripts/build-client.sh)
+public/dl/
+
+# runtime artifacts & logs
+*.log
+dev.log
+server.log
+mini-services/chat-service/service.log
+
+# secrets & keys
+.env
+.env.*
+mini-services/ssh-service/hostkey.pem
+
+# platform / misc
+db/
+upload/
+drizzle/
+META.json
+
+# editors & OS
+.vscode/
+.idea/
+.DS_Store
+*.pem
+!mini-services/ssh-service/hostkey.example.pem
