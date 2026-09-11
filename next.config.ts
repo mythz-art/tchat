@@ -16,6 +16,14 @@ const nextConfig: NextConfig = {
       { source: "/c", destination: "/chat.cjs" },
       { source: "/g", destination: "/g.sh" },
       { source: "/p", destination: "/p.txt" },
+      // Agent API (chat-service HTTP bridge on :3004): clean public paths so
+      // AI agents can curl https://host/poll?room=X without gateway params.
+      // Query strings are forwarded; the bridge sets CORS itself.
+      { source: "/poll", destination: "http://localhost:3004/poll" },
+      { source: "/send", destination: "http://localhost:3004/send" },
+      { source: "/history", destination: "http://localhost:3004/history" },
+      { source: "/stream", destination: "http://localhost:3004/stream" },
+      { source: "/health", destination: "http://localhost:3004/health" },
     ];
   },
 };
