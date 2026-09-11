@@ -26,6 +26,34 @@ if ($n -notmatch '^[A-Za-z0-9][A-Za-z0-9 ._-]{1,19}$') {
 $enc = [uri]::EscapeDataString($n)
 $renc = [uri]::EscapeDataString($R)
 $send = "$B/send?XTransformPort=3004"
+$histUrl = "$B/history?XTransformPort=3004&room=$renc&format=text"
+$script:histCursor = $null   # seq of the oldest loaded message (lazy-history cursor)
+$script:histMore = $false
+
+# /history [n] - fetch older messages straight from the bridge (text mode,
+# cursor comes back in the X-History-Next header). Printed locally.
+function Fetch-History([string]$arg) {
+    $lim = 30
+    if ($arg -match '\d+') { $lim = [Math]::Min(100, [int]$Matches[0]) }
+    if (-not $script:histMore -and $null -ne $script:histCursor) {
+        Write-Host '  (no older messages on record)'
+        return
+    }
+    $u = "$histUrl&limit=$lim"
+    if ($null -ne $script:histCursor) { $u = "$u&before=$($script:histCursor)" }
+    try {
+        $resp = Invoke-WebRequest -Uri $u -UseBasicParsing -TimeoutSec 20
+        if ($resp.Content) { $resp.Content -split "`n" | Where-Object { $_ } | ForEach-Object { Write-Host $_ } }
+        $hNext = $resp.Headers['X-History-Next']
+        $hMore = $resp.Headers['X-History-More']
+        if ($hNext) { $script:histCursor = [string]$hNext; $script:histMore = ($hMore -eq '1') }
+        else { $script:histMore = $false }
+        if ($script:histMore) { Write-Host '  (older messages loaded - /history for more)' }
+        else { Write-Host '  (start of history)' }
+    } catch {
+        Write-Host "history fetch failed: $($_.Exception.Message)"
+    }
+}
 
 # ---- receiver runspace: streams the room feed and prints it live ----
 $ps = [powershell]::Create()
@@ -88,6 +116,16 @@ try {
                     if ($msg -notmatch '\\$') { break }
                 }
                 if ($msg -in '/quit', '/exit', '/q') { break }
+                if ($msg -like '/history*') {
+                    Fetch-History ($msg -replace '^/history\s*', '')
+                    Write-Host 'you > ' -NoNewline
+                    continue
+                }
+                if ($msg -eq '/help') {
+                    Write-Host '  /me <action> · /nick <name> · /history [n] load older · /quit'
+                    Write-Host 'you > ' -NoNewline
+                    continue
+                }
                 if ($msg) {
                     try {
                         Invoke-RestMethod -Method Post -Uri $send -Body @{ name = $n; text = $msg; room = $R } | Out-Null

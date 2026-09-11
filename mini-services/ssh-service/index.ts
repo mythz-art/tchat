@@ -158,7 +158,7 @@ function bridgeSession(stream: any, roomLabel: string, onEnd: () => void) {
       const argStr = rest.join(' ')
       switch ((cmd || '').toLowerCase()) {
         case 'help':
-          printLine(`  ${DIM}/nick <name> | /me <action> | /users | /rooms | /clear | /quit${R}`)
+          printLine(`  ${DIM}/nick <name> | /me <action> | /users | /rooms | /history [n] | /clear | /quit${R}`)
           break
         case 'nick':
           if (argStr) sock.emit('nick', { name: argStr })
@@ -175,6 +175,16 @@ function bridgeSession(stream: any, roomLabel: string, onEnd: () => void) {
         case 'rooms':
           sock.emit('rooms')
           break
+        case 'history': {
+          const n = Math.min(100, Math.max(1, parseInt(argStr, 10) || 30))
+          if (histInFlight) {
+            printLine(`  ${DIM}history page already in flight…${R}`)
+            break
+          }
+          histInFlight = true
+          sock.emit('history', { before: histCursor ?? undefined, limit: n })
+          break
+        }
         case 'clear':
           write('\x1b[2J\x1b[H')
           break
@@ -223,6 +233,10 @@ function bridgeSession(stream: any, roomLabel: string, onEnd: () => void) {
       printLine(`  ${DIM}—— recent messages ————${R}`)
       for (const m of info.history) render(m)
       printLine(`  ${DIM}———————————————————————${R}`)
+      // v3.1: remember the oldest seq we rendered — /history pages above it.
+      const first = info.history[0]
+      if (first && typeof first.seq === 'number') histCursor = first.seq
+      if (info.hasMore) printLine(`  ${DIM}older messages on record — /history to load more${R}`)
     }
     printLine(`  ${DIM}Type /help for commands.${R}`)
     setPrompt(`${GREEN}${BOLD}${myName}${R} ${DIM}@${info.room || roomLabel}${R} ${GREEN}>${R} `)
@@ -237,6 +251,25 @@ function bridgeSession(stream: any, roomLabel: string, onEnd: () => void) {
 
   sock.on('message', (m: any) => render(m))
   sock.on('system', (m: any) => render(m))
+
+  // Lazy history (v3.1): /history pages OLDER messages downward from the
+  // oldest message rendered so far (cursor = its seq).
+  let histCursor: number | null = null
+  let histHasMore = false
+  let histInFlight = false
+  sock.on('history-page', (d: { messages?: any[]; hasMore?: boolean }) => {
+    histInFlight = false
+    const page = (d.messages || []).filter(m => m && typeof m.seq === 'number')
+    histHasMore = !!d.hasMore
+    if (!page.length) {
+      printLine(`  ${DIM}no older messages on record${R}`)
+      return
+    }
+    histCursor = page[0].seq
+    printLine(`  ${DIM}—— ${page.length} older message(s) ——${R}`)
+    for (const m of page) render(m)
+    printLine(histHasMore ? `  ${DIM}··· /history for more${R}` : `  ${DIM}··· start of history${R}`)
+  })
 
   sock.on('users-list', (d: { users: { name: string }[]; count: number }) => {
     printLine(`  ${DIM}${d.count} in this room: ${(d.users || []).map(u => u.name).join(', ') || '(nobody)'}${R}`)

@@ -136,6 +136,36 @@ See `docs/screenshots/` and the README.
 
 ---
 
+## Feature requests, round 2
+
+### "Can't see any history when I join — website or terminal" — **SHIPPED**
+Reported by the owner after watching a fresh join show only the live traffic.
+Root cause: history was RAM-only (15-message replay, room deleted when the last
+person left). Fixed in v3.1 with a full persistence layer:
+
+- every message is appended to a per-room JSONL log (`db/chat-history/<room>.jsonl`)
+  **before** broadcast; rooms re-hydrate from disk on first touch, so **service
+  restarts lose nothing** and empty rooms keep their log forever;
+- every client got lazy paging: the web lazy-loads older messages when you scroll
+  to the top (with viewport anchoring and dedupe); the native CLI and the SSH
+  bridge gained `/history [n]`; `g.sh` / `p.txt` fetch text pages with cursor
+  headers; ` socket.io` gained the `history` → `history-page` event pair.
+
+### Major feature: reliable message polling for AI agents — **SHIPPED**
+The owner's own fleet of AI agents (testers + a developer agent) needed a client
+that survives sandboxes which kill background processes. Enter `GET /poll`:
+
+- register once with `name=` → keep the returned `key` and `since` cursor;
+- poll with `key` + `since` → every missed message in order, never duplicated;
+  `hasMore` chases bursts; `since=0` replays the room's entire persisted log;
+- the poll itself is the heartbeat: identities live while they poll, quietly
+  time out after 90s (name freed, leave notice broadcast);
+- `POST /send` gained full command parity for poll identities (`/me`, `/nick`,
+  `/users`, `/rooms` answered inline, `/quit`);
+- documented end-to-end in **docs/API.md**, covered by `scripts/test-poll-api.ts`.
+
+---
+
 ## Verification
 
 Every fix is covered by automated suites (run from the repo root):
@@ -143,6 +173,8 @@ Every fix is covered by automated suites (run from the repo root):
 | Suite | Assertions |
 |---|---|
 | `bun run scripts/test-chat-e2e.ts` | 41 |
+| `bun run scripts/test-poll-api.ts` | 21 |
+| `bun run scripts/test-history-lazy.ts` | 26 |
 | `bun run scripts/test-multi-terminal.ts` | 21 |
 | `bun run scripts/test-ssh.ts` | 12 |
 | `bun run scripts/test-bundled-client.ts` | 6 |

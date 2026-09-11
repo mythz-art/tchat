@@ -6859,7 +6859,7 @@ Object.assign(lookup, {
 
 // scripts/chat-client-entry.ts
 var readline = __toESM(require("readline"));
-var VERSION = "3.0.0";
+var VERSION = "3.1.0";
 var DEFAULT_SERVER = "https://tchat.space-z.ai";
 var DEFAULT_ROOM = "lobby";
 var R = "\x1B[0m";
@@ -6939,7 +6939,7 @@ Examples:
   tchat                       # Enter -> lobby
 
 Inside the room:
-  /help  /nick <name>  /me <action>  /users  /rooms  /clear  /url  /quit`);
+  /help  /nick <name>  /me <action>  /users  /rooms  /history [n]  /clear  /url  /quit`);
 }
 function normalizeServerUrl(input) {
   let raw = stripUnsafe(input).trim();
@@ -6971,6 +6971,9 @@ var myName = argName ? stripUnsafe(argName).slice(0, 20) : "";
 var myRoom = argRoom ? stripUnsafe(argRoom).slice(0, 24) : "";
 var lastCtrlC = 0;
 var earlyInput = "";
+var histCursor = null;
+var histHasMore = false;
+var histLoading = false;
 var rl = readline.createInterface({
   input: process.stdin,
   output: process.stdout,
@@ -7033,11 +7036,17 @@ function enterRoom(info) {
   console.log(`  ${DIM}${info.count} guest(s) here: ${info.users.map((u) => u.name).join(", ")}${R}`);
   console.log(`  ${DIM}Type /help for commands · invite: tchat join ${myRoom}${R}`);
   console.log("");
-  if (Array.isArray(info.history) && info.history.length) {
+  const hist = Array.isArray(info.history) ? info.history : [];
+  histCursor = hist.length && typeof hist[0]?.seq === "number" ? hist[0].seq : null;
+  histHasMore = !!info.hasMore;
+  histLoading = false;
+  if (hist.length) {
     console.log(`  ${DIM}—— recent messages ————${R}`);
-    for (const m of info.history)
+    for (const m of hist)
       renderMessage(m);
     console.log(`  ${DIM}———————————————————————${R}`);
+    if (histHasMore)
+      console.log(`  ${DIM}older messages on record — /history to load more${R}`);
     console.log("");
   }
   rl.setPrompt(`${GREEN}${BOLD}${info.you}${R} ${DIM}@${myRoom}${R} ${GREEN}>${R} `);
@@ -7094,6 +7103,21 @@ socket.on("name-rejected", (data) => {
 });
 socket.on("message", (m) => renderMessage(m));
 socket.on("system", (m) => renderMessage(m));
+socket.on("history-page", (d) => {
+  histLoading = false;
+  const page = Array.isArray(d?.messages) ? d.messages : [];
+  if (!page.length) {
+    histHasMore = false;
+    printLine(`  ${DIM}no older messages on record${R}`);
+    return;
+  }
+  if (typeof page[0]?.seq === "number")
+    histCursor = page[0].seq;
+  histHasMore = !!d.hasMore;
+  for (const m of page)
+    renderMessage(m);
+  printLine(`  ${DIM}—— ${page.length} older message(s)${d.hasMore ? " · /history for more" : " · start of history"} ——${R}`);
+});
 socket.on("users-list", (data) => {
   const names = data.users.map((u) => u.name).join(", ") || "(nobody)";
   printLine(`  ${DIM}${data.count} in this room: ${names}${R}`);
@@ -7130,8 +7154,22 @@ function handleCommand(line) {
   switch ((cmd || "").toLowerCase()) {
     case "help":
       printLine(`  ${DIM}/nick <name>  change name | /me <action>  emote | /users  who is here${R}`);
-      printLine(`  ${DIM}/rooms  list active rooms | /clear  clear screen | /url  show server | /quit  leave${R}`);
+      printLine(`  ${DIM}/rooms  list rooms | /history [n]  load older messages | /clear | /url | /quit${R}`);
       return true;
+    case "history": {
+      const n = Math.max(1, Math.min(parseInt(argStr, 10) || 30, 100));
+      if (histLoading) {
+        printLine(`  ${DIM}history page already in flight…${R}`);
+        return true;
+      }
+      if (!histHasMore && histCursor !== null) {
+        printLine(`  ${DIM}no older messages on record${R}`);
+        return true;
+      }
+      histLoading = true;
+      socket.emit("history", { before: histCursor ?? undefined, limit: n });
+      return true;
+    }
     case "nick":
       if (!argStr)
         printLine(`${YELLOW}Usage: /nick <new-name>${R}`);

@@ -8,6 +8,9 @@
 B="${TCHAT_URL:-https://tchat.space-z.ai}"
 X="XTransformPort=3004"   # gateway port hint (harmless when hitting the service directly)
 R="${TCHAT_ROOM:-${ROOM:-lobby}}"  # room code (lobby by default)
+HC=""                    # lazy-history cursor (seq of oldest loaded message)
+HM=""                    # "1" while older history remains
+HTMP="${TMPDIR:-/tmp}/termchat-h.$$"
 
 command -v curl >/dev/null 2>&1 || { echo "termchat: curl is required"; exit 1; }
 
@@ -53,7 +56,29 @@ echo "connecting to $B ... (room: $R)"
 ) &
 WATCHER=$!
 
-trap 'kill $WATCHER 2>/dev/null; printf "\nbye!\n"; exit 0' INT TERM
+trap 'kill $WATCHER 2>/dev/null; rm -f "$HTMP"; printf "\nbye!\n"; exit 0' INT TERM
+
+# /history [n] — fetch older messages straight from the bridge (text mode,
+# cursor comes back in the X-History-Next header). Printed locally.
+fetch_history() {
+  N=$(printf %s "$1" | tr -cd '0-9')
+  [ -n "$N" ] || N=30
+  [ "$N" -le 100 ] 2>/dev/null || N=100
+  [ "$HM" = "1" ] || [ -z "$HC" ] || { printf '  (no older messages on record)\n'; return; }
+  BEFORE=""
+  [ -n "$HC" ] && BEFORE="&before=$HC"
+  curl -sD "$HTMP" -m 20 "$B/history?$X&room=$RENC&limit=$N$BEFORE&format=text" | while IFS= read -r l; do
+    printf '%s\n' "$l"
+  done
+  NEXT=$(tr -d '\r' < "$HTMP" | awk 'tolower($1)=="x-history-next:"{print $2}')
+  HM=$(tr -d '\r' < "$HTMP" | awk 'tolower($1)=="x-history-more:"{print $2}')
+  if [ -n "$NEXT" ]; then HC="$NEXT"; else HM=""; fi
+  if [ "$HM" = "1" ]; then
+    printf '  (older messages loaded · /history for more)\n'
+  else
+    printf '  (start of history)\n'
+  fi
+}
 
 while read_line MSG; do
   [ -z "$MSG" ] && continue
@@ -68,10 +93,20 @@ $NEXT"
     /quit|/exit|/q)
       curl -s -o /dev/null "$B/send?$X" --data-urlencode "name=$NAME" --data-urlencode "room=$R" --data-urlencode "text=/quit"
       break ;;
+    /history*)
+      ARG="${MSG#/history}"
+      fetch_history "$ARG"
+      printf 'you > '
+      ;;
+    /help)
+      printf '  /me <action> · /nick <name> · /history [n] load older · /quit\n'
+      printf 'you > '
+      ;;
     *)
       curl -s -o /dev/null "$B/send?$X" --data-urlencode "name=$NAME" --data-urlencode "room=$R" --data-urlencode "text=$MSG" ;;
   esac
 done
 
 kill $WATCHER 2>/dev/null
+rm -f "$HTMP"
 printf 'bye!\n'

@@ -8,13 +8,13 @@
  *   tchat --server <url> ...              point at another host (default: baked-in)
  *   CHAT_URL=<url> tchat ...              same via environment
  *
- * Once inside: /help /nick /me /users /rooms /clear /url /quit
+ * Once inside: /help /nick /me /users /rooms /history /clear /url /quit
  */
 
 import { io, type Socket } from 'socket.io-client'
 import * as readline from 'readline'
 
-const VERSION = '3.0.0'
+const VERSION = '3.1.0'
 const DEFAULT_SERVER = 'https://tchat.space-z.ai'
 const DEFAULT_ROOM = 'lobby'
 
@@ -108,7 +108,7 @@ Examples:
   tchat                       # Enter -> lobby
 
 Inside the room:
-  /help  /nick <name>  /me <action>  /users  /rooms  /clear  /url  /quit`)
+  /help  /nick <name>  /me <action>  /users  /rooms  /history [n]  /clear  /url  /quit`)
 }
 
 /** Ensure the gateway query XTransformPort=3003 is present (unless a direct port is used). */
@@ -146,6 +146,11 @@ let myName = argName ? stripUnsafe(argName).slice(0, 20) : ''
 let myRoom = argRoom ? stripUnsafe(argRoom).slice(0, 24) : ''
 let lastCtrlC = 0
 let earlyInput = '' // a line typed while still connecting — used as room (or name) once connected
+// Lazy history cursor: seq of the OLDEST message we have rendered, plus whether
+// the server says there is more below it. /history pages downward from here.
+let histCursor: number | null = null
+let histHasMore = false
+let histLoading = false
 
 const rl = readline.createInterface({
   input: process.stdin,
@@ -204,7 +209,7 @@ function askName() {
   })
 }
 
-function enterRoom(info: { you: string; room?: string; count: number; users: { name: string }[]; history: any[] }) {
+function enterRoom(info: { you: string; room?: string; count: number; users: { name: string }[]; history: any[]; hasMore?: boolean }) {
   state = 'chatting'
   myName = info.you
   myRoom = info.room || myRoom || DEFAULT_ROOM
@@ -213,10 +218,15 @@ function enterRoom(info: { you: string; room?: string; count: number; users: { n
   console.log(`  ${DIM}${info.count} guest(s) here: ${info.users.map(u => u.name).join(', ')}${R}`)
   console.log(`  ${DIM}Type /help for commands · invite: tchat join ${myRoom}${R}`)
   console.log('')
-  if (Array.isArray(info.history) && info.history.length) {
+  const hist = Array.isArray(info.history) ? info.history : []
+  histCursor = hist.length && typeof hist[0]?.seq === 'number' ? hist[0].seq : null
+  histHasMore = !!info.hasMore
+  histLoading = false
+  if (hist.length) {
     console.log(`  ${DIM}—— recent messages ————${R}`)
-    for (const m of info.history) renderMessage(m)
+    for (const m of hist) renderMessage(m)
     console.log(`  ${DIM}———————————————————————${R}`)
+    if (histHasMore) console.log(`  ${DIM}older messages on record — /history to load more${R}`)
     console.log('')
   }
   rl.setPrompt(`${GREEN}${BOLD}${info.you}${R} ${DIM}@${myRoom}${R} ${GREEN}>${R} `)
@@ -280,6 +290,22 @@ socket.on('name-rejected', (data: { reason: string }) => {
 socket.on('message', (m: any) => renderMessage(m))
 socket.on('system', (m: any) => renderMessage(m))
 
+// Older-history page arrives here (from /history). Rendered like normal
+// traffic above the prompt, oldest-first, with a one-line status footer.
+socket.on('history-page', (d: { messages?: any[]; hasMore?: boolean; before?: number | null }) => {
+  histLoading = false
+  const page = Array.isArray(d?.messages) ? d.messages : []
+  if (!page.length) {
+    histHasMore = false
+    printLine(`  ${DIM}no older messages on record${R}`)
+    return
+  }
+  if (typeof page[0]?.seq === 'number') histCursor = page[0].seq
+  histHasMore = !!d.hasMore
+  for (const m of page) renderMessage(m)
+  printLine(`  ${DIM}—— ${page.length} older message(s)${d.hasMore ? ' · /history for more' : ' · start of history'} ——${R}`)
+})
+
 socket.on('users-list', (data: { users: { name: string }[]; count: number }) => {
   const names = data.users.map(u => u.name).join(', ') || '(nobody)'
   printLine(`  ${DIM}${data.count} in this room: ${names}${R}`)
@@ -323,8 +349,22 @@ function handleCommand(line: string): boolean {
   switch ((cmd || '').toLowerCase()) {
     case 'help':
       printLine(`  ${DIM}/nick <name>  change name | /me <action>  emote | /users  who is here${R}`)
-      printLine(`  ${DIM}/rooms  list active rooms | /clear  clear screen | /url  show server | /quit  leave${R}`)
+      printLine(`  ${DIM}/rooms  list rooms | /history [n]  load older messages | /clear | /url | /quit${R}`)
       return true
+    case 'history': {
+      const n = Math.max(1, Math.min(parseInt(argStr, 10) || 30, 100))
+      if (histLoading) {
+        printLine(`  ${DIM}history page already in flight…${R}`)
+        return true
+      }
+      if (!histHasMore && histCursor !== null) {
+        printLine(`  ${DIM}no older messages on record${R}`)
+        return true
+      }
+      histLoading = true
+      socket.emit('history', { before: histCursor ?? undefined, limit: n })
+      return true
+    }
     case 'nick':
       if (!argStr) printLine(`${YELLOW}Usage: /nick <new-name>${R}`)
       else socket.emit('nick', { name: argStr })

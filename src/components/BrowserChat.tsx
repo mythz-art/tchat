@@ -16,6 +16,7 @@ type RoomMessage = {
   from?: string;
   text: string;
   ts: number;
+  seq?: number; // room-scoped monotonic sequence — cursor for lazy history
 };
 
 const NAME_COLORS = [
@@ -123,6 +124,7 @@ export default function BrowserChat({
   const [roomTotal, setRoomTotal] = useState(0);
 
   const [messages, setMessages] = useState<RoomMessage[]>([]);
+  const [hasMoreHistory, setHasMoreHistory] = useState(false);
   const [room, setRoom] = useState(initialRoom);
   const [webName, setWebName] = useState('');
   const [myName, setMyName] = useState('');
@@ -142,6 +144,17 @@ export default function BrowserChat({
   const autoJoinRetryRef = useRef(0);
   const outboxRef = useRef<string[]>([]);
   const usersReqRef = useRef(false);
+  // Lazy history (v3.1): paging state. oldestSeqRef = seq cursor of the oldest
+  // message we hold; scrollRestoreRef keeps the viewport anchored while older
+  // messages are prepended; atBottomRef avoids yanking the user down on live
+  // traffic while they are reading old messages.
+  const oldestSeqRef = useRef<number | null>(null);
+  const loadingHistoryRef = useRef(false);
+  const scrollRestoreRef = useRef<{ h: number; top: number } | null>(null);
+  const atBottomRef = useRef(true);
+  // Dedupe ledger: mount-only socket handlers cannot read fresh `messages`, so
+  // ids of every ingested message (live or replayed) live here instead.
+  const seenIdsRef = useRef<Set<string>>(new Set());
 
   const joined = !!joinedRoom;
 
@@ -184,12 +197,32 @@ export default function BrowserChat({
       setRoomTotal(d.count);
       onStats?.(d.total);
     });
-    socket.on('message', (m: RoomMessage) => setMessages(prev => [...prev.slice(-199), m]));
+    socket.on('message', (m: RoomMessage) => {
+      if (m?.id) {
+        seenIdsRef.current.add(m.id);
+        if (seenIdsRef.current.size > 4000) seenIdsRef.current = new Set([...seenIdsRef.current].slice(-2000));
+      }
+      setMessages(prev => [...prev.slice(-399), m]);
+    });
     socket.on('system', (m: RoomMessage) => {
-      setMessages(prev => [...prev.slice(-199), m]);
+      if (m?.id && !m.id.startsWith('local-')) seenIdsRef.current.add(m.id);
+      setMessages(prev => [...prev.slice(-399), m]);
       if (joinedRef.current) socket.emit('users');
     });
-    socket.on('joined', (d: { you: string; room?: string; count: number; users: { name: string }[]; history: RoomMessage[] }) => {
+    socket.on('history-page', (d: { room?: string; messages?: RoomMessage[]; hasMore?: boolean }) => {
+      loadingHistoryRef.current = false;
+      const seen = seenIdsRef.current;
+      const page = (d.messages || []).filter(m => m && typeof m.seq === 'number' && m.id && !seen.has(m.id));
+      hasMoreRef.current = !!d.hasMore;
+      setHasMoreHistory(!!d.hasMore);
+      if (!page.length) return;
+      for (const m of page) seen.add(m.id);
+      if (typeof page[0].seq === 'number') oldestSeqRef.current = page[0].seq;
+      const el = logRef.current;
+      if (el) scrollRestoreRef.current = { h: el.scrollHeight, top: el.scrollTop };
+      setMessages(prev => [...page, ...prev].slice(-799));
+    });
+    socket.on('joined', (d: { you: string; room?: string; count: number; users: { name: string }[]; history: RoomMessage[]; hasMore?: boolean; lastSeq?: number }) => {
         setMyName(d.you);
         const r = d.room || room || 'lobby';
         setJoinedRoom(r);
@@ -202,7 +235,15 @@ export default function BrowserChat({
         setJoinError('');
         setRoomTotal(d.count);
         setUsers(d.users.map(u => u.name));
-        setMessages(d.history && d.history.length ? d.history : []);
+        const hist = (d.history || []).filter(m => m && m.id);
+        setMessages(hist);
+        seenIdsRef.current = new Set(hist.map(m => m.id));
+        oldestSeqRef.current = hist.length && typeof hist[0].seq === 'number' ? hist[0].seq : null;
+        loadingHistoryRef.current = false;
+        hasMoreRef.current = !!d.hasMore;
+        setHasMoreHistory(!!d.hasMore);
+        scrollRestoreRef.current = null;
+        atBottomRef.current = true;
         // Joined from the homepage card: sync the URL to /r/<room> WITHOUT
         // navigating (no remount, no second join). A refresh then lands on
         // the room page and auto-resumes from the saved session.
@@ -279,14 +320,12 @@ export default function BrowserChat({
   // Prefill the last session (name; room on the home page) so rejoining is
   // one click instead of retyping everything. Deliberate one-shot mount-time
   // prefill from localStorage: cannot run during render (SSR has no storage).
-  /* eslint-disable react-hooks/set-state-in-effect */
   useEffect(() => {
     const saved = loadSession();
     if (!saved) return;
     setWebName(saved.name);
     if (!lockedRoom && !initialRoom && saved.room) setRoom(saved.room);
   }, []);
-  /* eslint-enable react-hooks/set-state-in-effect */
 
   // Auto-resume on locked room pages: a refresh keeps the user in the room
   // instead of kicking them back to the join form. No setState here — the
@@ -326,10 +365,39 @@ export default function BrowserChat({
     };
   }, [joined, initialRoom, room]);
 
+  // Keep the viewport sane across message updates: pin to bottom for live
+  // traffic, but PRESERVE position when older history was prepended.
   useEffect(() => {
     const el = logRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
+    if (!el) return;
+    const restore = scrollRestoreRef.current;
+    if (restore) {
+      scrollRestoreRef.current = null;
+      el.scrollTop = restore.top + (el.scrollHeight - restore.h);
+    } else if (atBottomRef.current) {
+      el.scrollTop = el.scrollHeight;
+    }
   }, [messages]);
+
+  const onLogScroll = useCallback(() => {
+    const el = logRef.current;
+    if (!el) return;
+    atBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+    if (atBottomRef.current) return;
+    if (el.scrollTop < 56) loadOlderRef.current();
+  }, []);
+
+  const loadOlder = useCallback(() => {
+    const sock = socketRef.current;
+    if (!sock || loadingHistoryRef.current || !hasMoreRef.current) return;
+    loadingHistoryRef.current = true;
+    sock.emit('history', { before: oldestSeqRef.current ?? undefined, limit: 30 });
+  }, []);
+  const loadOlderRef = useRef(loadOlder);
+  // hasMore lives in a ref (mirrored at the same ingestion points as the
+  // state below) so the scroll handler always sees the latest value without
+  // re-binding onScroll on every state flip.
+  const hasMoreRef = useRef(false);
 
   const joinWeb = useCallback(() => {
     const name = webName.trim();
@@ -363,6 +431,15 @@ export default function BrowserChat({
     setOutboxCount(0);
     setJoinedRoom('');
     setMessages([]);
+    // Refs mirror paging state for the unthrottled scroll handler; resetting
+    // them here is plain event-handler cleanup, no render-phase writes.
+    // eslint-disable-next-line react-hooks/immutability
+    hasMoreRef.current = false;
+    setHasMoreHistory(false);
+    oldestSeqRef.current = null;
+    loadingHistoryRef.current = false;
+    scrollRestoreRef.current = null;
+    seenIdsRef.current = new Set();
     setUsers([]);
     setRoomTotal(0);
     if (typeof window !== 'undefined' && !lockedRoom) {
@@ -385,7 +462,7 @@ export default function BrowserChat({
         setMessages(prev => [...prev.slice(-199), { id: localId(), kind: 'system' as const, subtype: 'local', text, ts: Date.now() }]);
       switch ((cmd || '').toLowerCase()) {
         case 'help':
-          local('commands: /nick <name> · /me <action> · /users · /rooms · /clear · /url · /help · /quit');
+          local('commands: /nick <name> · /me <action> · /users · /rooms · /history <n> · /clear · /url · /help · /quit');
           return true;
         case 'me':
           if (!arg) {
@@ -411,6 +488,11 @@ export default function BrowserChat({
           return true;
         case 'clear':
           setMessages([]);
+          return true;
+        case 'history':
+          if (!sock) return true;
+          loadOlderRef.current();
+          if (!hasMoreRef.current) local('no older messages on record for this room');
           return true;
         case 'url':
           local(`server: tchat.space-z.ai · room: ${joinedRoom || room || 'lobby'} · web transport: socket.io`);
@@ -532,8 +614,20 @@ export default function BrowserChat({
         <>
           <div
             ref={logRef}
+            onScroll={onLogScroll}
             className={`rounded-lg border border-zinc-800 bg-zinc-950 p-3 ${height} overflow-y-auto font-mono text-[13px] leading-relaxed space-y-1 [scrollbar-color:#3f3f46_transparent]`}
           >
+            {hasMoreHistory && (
+              <div className="flex justify-center pb-1">
+                <button
+                  type="button"
+                  onClick={loadOlder}
+                  className="text-[11px] font-mono text-emerald-400 border border-emerald-500/30 rounded-full px-3 py-0.5 hover:bg-emerald-500/10 transition-colors"
+                >
+                  ↑ load older messages
+                </button>
+              </div>
+            )}
             {messages.length === 0 && (
               <p className="text-zinc-500 text-center py-10">No messages yet — be the first to say hi.</p>
             )}
