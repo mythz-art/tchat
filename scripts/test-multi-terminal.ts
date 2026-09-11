@@ -109,13 +109,20 @@ function spawnTerm(cmd: string, args: string[], env: Record<string, string>): Te
   return new Term(child)
 }
 
-function once<T = any>(socket: Socket, event: string, timeoutMs = 6000): Promise<T> {
+function once<T = any>(socket: Socket, event: string, timeoutMs = 6000, pred?: (data: T) => boolean): Promise<T> {
   return new Promise((resolve, reject) => {
     const t = setTimeout(() => reject(new Error(`timeout waiting "${event}"`)), timeoutMs)
-    socket.once(event, (data: T) => {
+    const handler = (data: T) => {
+      // optional predicate: skip events that belong to someone else (e.g. the
+      // sender's own echo arriving late — same race class as the pump fix)
+      if (pred && !pred(data)) {
+        socket.once(event, handler)
+        return
+      }
       clearTimeout(t)
       resolve(data)
-    })
+    }
+    socket.once(event, handler)
   })
 }
 
@@ -197,13 +204,13 @@ async function main() {
   await tom.waitFor(o => stripAnsi(o).includes(`${NINA} joined the room`)) // system notice sanity
 
   tom.write('hi from node cli\n')
-  const gotTom = await once<any>(ollie, 'message', 6000)
+  const gotTom = await once<any>(ollie, 'message', 6000, m => m.from === TOM)
   ok('node cli message reached Ollie', gotTom.from === TOM && gotTom.text === 'hi from node cli')
   await nina.waitFor(o => stripAnsi(o).includes(`${TOM}: hi from node cli`))
   ok('native binary saw node cli message', true)
 
   nina.write('hi from native binary\n')
-  const gotNina = await once<any>(ollie, 'message', 6000)
+  const gotNina = await once<any>(ollie, 'message', 6000, m => m.from === NINA)
   ok('native binary message reached Ollie', gotNina.from === NINA && gotNina.text === 'hi from native binary')
   await tom.waitFor(o => stripAnsi(o).includes(`${NINA}: hi from native binary`))
   ok('node cli saw native binary message', true)
@@ -247,7 +254,7 @@ async function main() {
   ollie.disconnect()
 
   console.log(`\nResult: ${passed} passed, ${failed} failed`)
-  process.exitCode = failed === 0 ? 0 : 1
+  process.exit(failed === 0 ? 0 : 1) // hard exit: spawned pty children keep the loop alive
 }
 
 main()

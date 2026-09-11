@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { motion } from 'framer-motion';
 import {
@@ -67,6 +67,30 @@ export default function Home() {
   const router = useRouter();
   const [online, setOnline] = useState(0);
   const [roomCode, setRoomCode] = useState('');
+
+  // Live "N online" counter for everyone on the page (joined or not).
+  // Polls the chat-service /health endpoint through the same gateway the
+  // socket uses; the BrowserChat onStats callback keeps it updated in
+  // between polls once you actually join a room.
+  useEffect(() => {
+    let alive = true;
+    const poll = async () => {
+      try {
+        const res = await fetch('/health?XTransformPort=3004', { cache: 'no-store' });
+        if (!res.ok) return;
+        const j = await res.json();
+        if (alive && j?.ok) setOnline(Number(j.users) || 0);
+      } catch {
+        /* gateway hiccup — keep the last known value */
+      }
+    };
+    poll();
+    const iv = setInterval(poll, 5000);
+    return () => {
+      alive = false;
+      clearInterval(iv);
+    };
+  }, []);
 
   const openRoom = useCallback(() => {
     const r = cleanRoomInput(roomCode) || 'lobby';

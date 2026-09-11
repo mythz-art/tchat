@@ -23,6 +23,20 @@ Live deployment: **[https://tchat.space-z.ai](https://tchat.space-z.ai)**
 
 ---
 
+## Screenshots
+
+| Native CLI | HTTPS terminal (zero install) |
+|---|---|
+| ![native cli](docs/screenshots/terminal-cli.png) | ![https terminal](docs/screenshots/terminal-https.png) |
+
+| Web — landing | Web — room page | Web — live room |
+|---|---|---|
+| ![homepage](docs/screenshots/web-homepage.png) | ![methods](docs/screenshots/web-methods.png) | ![room](docs/screenshots/web-room.png) |
+
+---
+
+
+
 ## Three ways in
 
 Pick whichever fits the moment — all three land in the **same rooms, in real time**.
@@ -109,11 +123,12 @@ try it immediately.
 | `/nick <name>` | rename yourself |
 | `/me <action>` | send an emote (`/me waves`) |
 | `/users` | list everyone in this room |
-| `/rooms` | list active rooms + headcounts (CLI / SSH) |
+| `/rooms` | list active rooms + headcounts (every client, incl. web) |
 | `/clear` | clear the terminal screen |
 | `/url` | show server + room you are on |
 | `/help` | command help |
 | `/quit` | leave the room |
+| *(multi-line)* | end a line with `\` and continue on the next line — terminal clients send it as ONE message |
 
 ---
 
@@ -123,13 +138,14 @@ try it immediately.
   terminal and browser in the room.
 - **Rooms** — unlimited, implicit (created on first join), auto-pruned when empty;
   presence and history are scoped per room.
-- **History** — last 20 messages replayed on join, 50 kept per room.
+- **History** — last 20 messages replayed on join, 50 kept per room; an empty room keeps its history for a 10-minute grace window before cleanup (quick refresh/churn no longer erases a conversation).
 - **Cross-transport** — native CLI (WebSocket), zero-install terminal (SSE + POST),
   browser (WebSocket) and SSH bridge are all first-class citizens of the same room.
 - **No rate limiting** — chat freely; capacity caps (200 concurrent clients) exist only
   as resource protection.
 - **Zero-dependency clients** — the CLI is a self-contained native binary; the
   HTTPS-terminal client needs nothing but `curl`/PowerShell.
+- **Multi-line messages** — trailing `\` continuation in the terminal clients; newlines preserved end-to-end and rendered on the web.
 - **Deterministic name colors** in terminals; dark-first web UI.
 
 ## How it works
@@ -202,6 +218,13 @@ bun scripts/test-bundled-client.ts  #  6: the actual public/chat.cjs subprocess
   it is a guest chat door, not a shell. It never grants shell access.
 - Installers fetch binaries only from the host you point them at
   (`TCHAT_DOWNLOAD_BASE` to override).
+
+## Bug & feature log
+
+Community reports from the `tchat-bug` room and how each one was fixed live in
+**[docs/BUGS-FIXED.md](docs/BUGS-FIXED.md)** — slash commands on the web, refresh
+auto-rejoin, stale-name eviction, offline queueing, live counters, multi-line
+input, and the multi-instance flapping investigation.
 
 ## License
 

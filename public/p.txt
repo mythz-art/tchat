@@ -1,4 +1,4 @@
-# TermChat - zero-install PowerShell client (no Node.js needed).
+﻿# TermChat - zero-install PowerShell client (no Node.js needed).
 # Run it with:    iex (irm https://tchat.space-z.ai/p)
 # Join a room:    $env:TCHAT_ROOM='7XK92'; iex (irm https://tchat.space-z.ai/p)
 # Works on Windows PowerShell 5.1+ and PowerShell 7+. Uses built-in curl.exe.
@@ -30,7 +30,7 @@ $send = "$B/send?XTransformPort=3004"
 # ---- receiver runspace: streams the room feed and prints it live ----
 $ps = [powershell]::Create()
 $ps.AddScript({
-    param($url, $exe)
+    param($url, $exe, $pongUrl)
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $exe
     $psi.Arguments = '-Ns --max-time 86400 "' + $url + '"'
@@ -44,9 +44,21 @@ $ps.AddScript({
             $t = $line.Substring(5)
             if ($t.Length -gt 0) { Write-Host $t }
         }
+        elseif ($line.StartsWith(': hb ')) {
+            # liveness heartbeat: reply /pong so the server knows we are alive
+            $key = $line.Substring(5).Trim().Split(' ')[-1]
+            if ($key -like 'sse:*') {
+                $pp = New-Object System.Diagnostics.ProcessStartInfo
+                $pp.FileName = $exe
+                $pp.Arguments = '-s -o NUL -m 5 "' + $pongUrl + '" --data-urlencode "key=' + $key + '"'
+                $pp.UseShellExecute = $false
+                $pp.CreateNoWindow = $true
+                [System.Diagnostics.Process]::Start($pp) | Out-Null
+            }
+        }
     }
     Write-Host '*** disconnected - bye!'
-}).AddArgument("$B/stream?XTransformPort=3004&name=$enc&room=$renc").AddArgument($curlExe) | Out-Null
+}).AddArgument("$B/stream?XTransformPort=3004&name=$enc&room=$renc").AddArgument($curlExe).AddArgument("$B/pong?XTransformPort=3004") | Out-Null
 $handle = $ps.BeginInvoke()
 
 # ---- sender: non-blocking console input on this thread ----
@@ -58,6 +70,23 @@ try {
             $k = [Console]::ReadKey($true)
             if ($k.Key -eq 'Enter') {
                 $msg = $sb.ToString(); [void]$sb.Clear(); Write-Host ''
+                # trailing backslash = the message continues on the next line (multi-line)
+                while ($msg.EndsWith('\')) {
+                    $msg = $msg.Substring(0, $msg.Length - 1)
+                    Write-Host '... > ' -NoNewline
+                    while ($true) {
+                        if ([Console]::KeyAvailable) {
+                            $k2 = [Console]::ReadKey($true)
+                            if ($k2.Key -eq 'Enter') { Write-Host ''; break }
+                            elseif ($k2.Key -eq 'Backspace') { if ($sb.Length -gt 0) { [void]$sb.Remove($sb.Length - 1, 1); Write-Host "`b `b" -NoNewline } }
+                            elseif ($k2.Key -eq 'C' -and ($k2.Modifiers -band [System.ConsoleModifiers]::Control)) { break }
+                            elseif ($k2.KeyChar -and -not [char]::IsControl($k2.KeyChar)) { [void]$sb.Append($k2.KeyChar); Write-Host $k2.KeyChar -NoNewline }
+                        }
+                        else { Start-Sleep -Milliseconds 60 }
+                    }
+                    $msg = $msg + $sb.ToString(); [void]$sb.Clear()
+                    if ($msg -notmatch '\\$') { break }
+                }
                 if ($msg -in '/quit', '/exit', '/q') { break }
                 if ($msg) {
                     try {

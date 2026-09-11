@@ -38,6 +38,14 @@ echo "connecting to $B ... (room: $R)"
   curl -Ns --max-time 86400 "$B/stream?$X&name=$ENC&room=$RENC" | while IFS= read -r line; do
     case "$line" in
       data:?*) printf '%s\n' "${line#data: }"; printf 'you > ' ;;
+      # liveness heartbeat: reply /pong so the server knows we are alive
+      # (format ": hb <seq> <key>" — invisible in the terminal)
+      :?*)
+        HK="${line##* }"
+        case "$HK" in
+          sse:*) curl -s -o /dev/null -m 5 "$B/pong?$X" --data-urlencode "key=$HK" & ;;
+        esac
+        ;;
     esac
   done
   printf '\n*** disconnected — bye!\n'
@@ -49,6 +57,13 @@ trap 'kill $WATCHER 2>/dev/null; printf "\nbye!\n"; exit 0' INT TERM
 
 while read_line MSG; do
   [ -z "$MSG" ] && continue
+  # trailing backslash = the message continues on the next line (multi-line)
+  while printf %s "$MSG" | grep -q '\\$'; do
+    MSG="${MSG%\\}"
+    read_line NEXT || break
+    MSG="$MSG
+$NEXT"
+  done
   case "$MSG" in
     /quit|/exit|/q)
       curl -s -o /dev/null "$B/send?$X" --data-urlencode "name=$NAME" --data-urlencode "room=$R" --data-urlencode "text=/quit"
