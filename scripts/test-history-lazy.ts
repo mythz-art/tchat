@@ -28,7 +28,7 @@ const PORT_BRIDGE = PORT_IO + 1
 const BASE_IO = `http://localhost:${PORT_IO}`
 const BRIDGE = `http://localhost:${PORT_BRIDGE}`
 const ROOM = 'histroom'
-const N_MSGS = 40 // > 30 (default page) so pagination must wrap
+const N_MSGS = 80 // > 50 (join replay window) so lazy pagination must wrap
 
 let passed = 0
 let failed = 0
@@ -143,7 +143,7 @@ try {
   const joinedP = once<any>(reader, 'joined')
   reader.emit('join', { name: 'reader', room: ROOM })
   const joined = await joinedP
-  ok('join replayes 30 recent messages', Array.isArray(joined.history) && joined.history.length === 30, `got ${joined.history?.length}`)
+  ok('join replayes 50 recent messages', Array.isArray(joined.history) && joined.history.length === 50, `got ${joined.history?.length}`)
   ok('join marks hasMore=true', joined.hasMore === true)
   ok('join payload carries lastSeq', typeof joined.lastSeq === 'number' && joined.lastSeq >= N_MSGS, `lastSeq=${joined.lastSeq}`)
   const seqs = joined.history.map((m: any) => m.seq)
@@ -173,7 +173,7 @@ try {
   const r1 = await (await fetch(`${BRIDGE}/history?room=${ROOM}&limit=35`)).json()
   ok('HTTP json: page size honored', r1.messages.length === 35, `got ${r1.messages?.length}`)
   const r1NewestChat = [...r1.messages].reverse().find((m: any) => m.kind === 'chat')?.text
-  ok('HTTP json: newest page ends at last chat msg', r1NewestChat === 'msg 40', r1NewestChat)
+  ok('HTTP json: newest page ends at last chat msg', r1NewestChat === `msg ${String(N_MSGS).padStart(2, '0')}`, r1NewestChat)
   ok('HTTP json: hasMore=true on latest page', r1.hasMore === true)
   const r2 = await (await fetch(`${BRIDGE}/history?room=${ROOM}&before=${r1.messages[0].seq}&limit=35`)).json()
   ok('HTTP json: second page reaches older messages', r2.messages.length > 0 && r2.messages[0].seq < r1.messages[0].seq)
@@ -217,8 +217,8 @@ try {
   const j2P = once<any>(restartReader, 'joined')
   restartReader.emit('join', { name: 'afterrestart', room: ROOM })
   const j2 = await j2P
-  ok('RESTART: join replays hydrated history', j2.history.length === 30 && j2.hasMore === true)
-  // msg 01 sits BELOW the 30-item replay window now — reach it by paging, as
+  ok('RESTART: join replays hydrated history', j2.history.length === 50 && j2.hasMore === true)
+  // msg 01 sits BELOW the 50-item replay window now — reach it by paging, as
   // any lazy client would (this is the cross-restart socket-path proof).
   const restCollected: any[] = [...j2.history]
   let restMore = true

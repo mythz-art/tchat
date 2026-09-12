@@ -166,6 +166,54 @@ that survives sandboxes which kill background processes. Enter `GET /poll`:
 
 ---
 
+## #25 — "all history is removing and not showing in website or terminal" — permanent history (v3.3)
+
+**Reported:** via the meta-channel (owner, after chatting in room `tex`). Messages
+sent during a session vanished: rejoining the room (web, SSH or CLI) showed none
+of them.
+
+**Diagnosis — three stacked durability holes:**
+
+1. **`bun --hot` in the dev runner.** A hot module reload re-executes
+   `index.ts` in place: the `rooms` map (all live history) resets and — worse —
+   the surviving listener can keep serving traffic from a stale module instance
+   whose write path never ran. Evidence: room `tex` was chatty for 25 minutes
+   while its `tex.jsonl` never appeared on disk; after the reload
+   `GET /history?room=tex` returned `lastSeq: 0`.
+2. **No fsync, no rollback healing.** `appendFileSync` is not durable and, if
+   the host restores an older disk snapshot while the process keeps running,
+   the JSONL silently regresses behind what RAM knows — nothing ever repaired it.
+3. **Test harness races.** `test-ssh.ts` could catch the peer's own echo of an
+   earlier send; `test-history-lazy.ts` seeded only 40 messages, which the new
+   50-message join replay swallows whole.
+
+**Fix:**
+
+- **No more hot reload, ever**: `mini-services/chat-service` now runs
+  `bun index.ts` (plain). State lives in one stable process; restarts re-hydrate
+  from disk.
+- **`appendDurable()`**: every append stats the JSONL first — if the file is
+  missing or *shorter* than the byte size we last wrote, the log is rebuilt
+  from the in-RAM window (fsync'd) before appending, and a line can never be
+  written twice. Each append ends in `fdatasync`.
+- **Durability sweeper** (60s): any live room whose disk log regressed behind
+  RAM is rebuilt automatically; the disk log can no longer silently lose to a
+  snapshot restore.
+- `hydrateRoom()` now records the file size and last on-disk seq so the
+  self-heal has a baseline.
+- Join replay raised: **50** messages on socket.io join (web/CLI/SSH),
+  **30** on SSE join; lazy paging beyond that is unchanged.
+- Tests: `nextFrom()` helper skips self-echoes in `test-ssh.ts`; the lazy suite
+  now seeds 80 messages so paging wraps the 50-item replay window.
+
+**Verified live:** send → message on disk; hot-reload-equivalent state loss →
+history hydrated back from JSONL; JSONL deleted → next append rebuilt the full
+log from RAM, zero duplicates; browser join → reload → full history restored
+(screenshot `.build/history-after-reload.png`). Suites: 41 + 21 + 26 + 21 + 12 +
+6 + 5 + zombie green.
+
+---
+
 ## Verification
 
 Every fix is covered by automated suites (run from the repo root):

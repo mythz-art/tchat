@@ -39,10 +39,27 @@
  * straight from disk. Empty rooms may still be dropped from RAM after the
  * grace period, but their log survives and re-hydrates on the next touch:
  * history is NEVER lost when the service restarts or a room goes quiet.
+ *
+ * Durability (v3.3): writes are fsync'd, and both the per-append path and a
+ * 60s sweeper detect a disk log that went missing or SHRANK behind RAM (host
+ * snapshot restore / truncation) and rebuild it from the RAM window — the
+ * disk log can never silently regress behind what the process has seen.
+ * NOTE: the service must run WITHOUT `bun --hot` — a hot module reload
+ * re-executes this file and resets the rooms map (live state loss).
  */
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'http'
-import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs'
+import {
+  closeSync,
+  existsSync,
+  fdatasyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  statSync,
+  writeFileSync,
+  writeSync,
+} from 'node:fs'
 import { join } from 'node:path'
 import { Server, type Socket } from 'socket.io'
 
@@ -54,8 +71,8 @@ const MAX_ROOM_LEN = 24
 const MAX_TEXT_LEN = 500
 // History (v3.1): everything is persisted to disk; RAM holds a generous window.
 const HISTORY_RAM = 2000 // in-RAM messages per room (older pages stream from disk)
-const HISTORY_REPLAY_SOCKET = 30 // recent messages replayed on socket.io join
-const HISTORY_REPLAY_SSE = 15 // recent messages replayed on SSE join
+const HISTORY_REPLAY_SOCKET = 50 // recent messages replayed on socket.io join
+const HISTORY_REPLAY_SSE = 30 // recent messages replayed on SSE join
 const HISTORY_PAGE_DEFAULT = 30 // page size when the client does not ask
 const HISTORY_PAGE_MAX = 100
 
@@ -127,6 +144,8 @@ interface Room {
   seq: number // last assigned message sequence
   hydrated?: boolean // disk log already loaded into RAM for this room object
   diskMinSeq?: number // smallest seq that exists on disk (for hasMore math)
+  diskBytes?: number // byte size of the room's JSONL as of our last write
+  lastDiskSeq?: number // seq of the last line known to be on disk
   everJoined?: boolean // at least one successful join happened here
   emptyAt?: number // set when the last user leaves; room kept for history grace
 }
@@ -250,9 +269,68 @@ function hydrateRoom(room: Room) {
     room.history = msgs.slice(-HISTORY_RAM)
     room.seq = msgs[msgs.length - 1]!.seq!
     room.diskMinSeq = msgs[0]?.seq
+    room.diskBytes = statSync(p).size
+    room.lastDiskSeq = msgs[msgs.length - 1]!.seq!
     console.log(`[history] hydrated ${room.label}: ${room.history.length} in RAM, seq ${room.diskMinSeq}..${room.seq}`)
   } catch (e) {
     console.error(`[history] hydrate failed for ${room.key}:`, e)
+  }
+}
+
+/** Rebuild a room's JSONL from the in-RAM window (fsync'd). Used when the
+ * file on disk is found missing or SHORTER than what we already wrote — e.g.
+ * the host restored an older disk snapshot while the process kept running.
+ * RAM is the source of truth for the newest HISTORY_RAM messages; the disk
+ * log must never regress behind it. */
+function rebuildRoomLog(room: Room): void {
+  const p = roomLogPath(room.key)
+  const text = room.history.map(m => JSON.stringify(m) + '\n').join('')
+  writeFileSync(p, text)
+  const fh = openSync(p, 'r+')
+  try {
+    fdatasyncSync(fh)
+  } finally {
+    closeSync(fh)
+  }
+  room.diskBytes = Buffer.byteLength(text)
+  room.lastDiskSeq = room.history.length ? room.history[room.history.length - 1]!.seq : room.lastDiskSeq
+  room.diskMinSeq = room.history[0]?.seq
+  console.log(`[history] repaired ${room.label}: rebuilt log from RAM (${room.history.length} msgs, ${room.diskBytes}B)`)
+}
+
+/** Append messages to the room's JSONL durably: rollback check + fsync.
+ * If the file on disk is smaller than our last recorded size, the disk
+ * regressed (snapshot restore / truncation) — rebuild from RAM first. */
+function appendDurable(room: Room, msgs: AnyMessage[]): void {
+  const p = roomLogPath(room.key)
+  let size = -1
+  try {
+    size = statSync(p).size
+  } catch {}
+  if (room.diskBytes !== undefined && (size < 0 || size < room.diskBytes)) {
+    // file missing entirely OR shorter than what we already wrote -> rebuild
+    rebuildRoomLog(room)
+  } else if (room.diskBytes === undefined) {
+    room.diskBytes = Math.max(0, size) // adopt whatever a previous run wrote
+  }
+  // A rebuild already flushed the whole RAM window (including anything with
+  // seq <= lastDiskSeq) — never write a line twice.
+  const pending = msgs.filter(
+    m => typeof m.seq !== 'number' || room.lastDiskSeq === undefined || m.seq > room.lastDiskSeq
+  )
+  const fh = openSync(p, 'a')
+  try {
+    for (const m of pending) {
+      const line = JSON.stringify(m) + '\n'
+      writeSync(fh, line)
+      room.diskBytes = (room.diskBytes ?? 0) + Buffer.byteLength(line)
+      if (typeof m.seq === 'number') room.lastDiskSeq = m.seq
+    }
+    try {
+      fdatasyncSync(fh)
+    } catch {}
+  } finally {
+    closeSync(fh)
   }
 }
 
@@ -261,7 +339,7 @@ function pushHistory(room: Room, msg: AnyMessage) {
   room.history.push(msg)
   try {
     mkdirSync(HISTORY_DIR, { recursive: true })
-    appendFileSync(roomLogPath(room.key), JSON.stringify(msg) + '\n')
+    appendDurable(room, [msg])
   } catch (e) {
     console.error(`[history] append failed for ${room.key}:`, e)
   }
@@ -1140,6 +1218,35 @@ setInterval(() => {
     ) {
       console.log(`[sweeper] empty room "${room.label}" dropped after ${EMPTY_ROOM_GRACE_MS / 60000}min grace`)
       rooms.delete(key)
+    }
+  }
+}, 60_000).unref()
+
+/* ---------- durability sweeper: keep every room's disk log in step with RAM ----------
+ * Every 60s each live room's JSONL is stat-checked. If the file went missing or
+ * SHRANK behind what we already wrote (host snapshot restore rolled the disk
+ * back while this process kept running), the log is rebuilt from the in-RAM
+ * window so history can never silently regress to an older snapshot. */
+setInterval(() => {
+  for (const room of rooms.values()) {
+    if (!room.everJoined || !room.history.length) continue
+    try {
+      let size = -1
+      try {
+        size = statSync(roomLogPath(room.key)).size
+      } catch {}
+      if (size === room.diskBytes) continue
+      if (size >= 0 && room.diskBytes !== undefined && size > room.diskBytes) {
+        room.diskBytes = size // grew out-of-band (e.g. a second writer) — adopt, never clobber
+        continue
+      }
+      if (room.diskBytes === undefined && size >= 0) {
+        room.diskBytes = size // file appeared out-of-band — adopt
+        continue
+      }
+      rebuildRoomLog(room)
+    } catch (e) {
+      console.error(`[history] sweep error for ${room.key}:`, e)
     }
   }
 }, 60_000).unref()

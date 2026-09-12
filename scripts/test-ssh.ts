@@ -95,6 +95,16 @@ function once<T = any>(socket: Socket, event: string, timeoutMs = 8000): Promise
   })
 }
 
+/** Next 'message' event from a SPECIFIC sender — skips the peer's own echo
+ * of earlier sends, which otherwise races the arm of the next listener. */
+async function nextFrom(socket: Socket, fromName: string, timeoutMs = 8000): Promise<any> {
+  const deadline = Date.now() + timeoutMs
+  for (;;) {
+    const m = await once<any>(socket, 'message', Math.max(1000, deadline - Date.now()))
+    if (String(m?.from || '').toLowerCase() === fromName.toLowerCase()) return m
+  }
+}
+
 async function main() {
   console.log('TermChat SSH E2E — starting\n')
   const NAME = `SshSue${Math.random().toString(36).slice(2, 5)}`
@@ -151,16 +161,14 @@ async function main() {
   ok('socket.io message reached SSH session', true)
 
   // --- SSH -> socket.io delivery ---
-  const gotP = once<any>(peer, 'message')
   term.write('hello from ssh\r')
-  const got = await gotP
-  ok('ssh message reached socket.io peer', got.from === NAME && got.text === 'hello from ssh')
+  const got = await nextFrom(peer, NAME)
+  ok('ssh message reached socket.io peer', got.text === 'hello from ssh', JSON.stringify(got.text))
 
   // --- /me over ssh ---
-  const actP = once<any>(peer, 'message')
   term.write('/me waves from the shell\r')
-  const act = await actP
-  ok('ssh /me action delivered', act.kind === 'action' && act.from === NAME && act.text === 'waves from the shell')
+  const act = await nextFrom(peer, NAME)
+  ok('ssh /me action delivered', act.kind === 'action' && act.text === 'waves from the shell', JSON.stringify(act))
 
   // --- /users over ssh ---
   term.write('/users\r')
