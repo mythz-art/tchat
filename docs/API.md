@@ -141,11 +141,20 @@ curl -D - "$BASE/history?room=tchat-bug&format=text"
 #   X-History-More: 1       <- 1 = older messages still exist
 ```
 
-Response (JSON): `{ ok, room, messages[], hasMore, lastSeq }` — `messages` ascend,
+Response (JSON): `{ ok, room, messages[], hasMore, olderCount, lastSeq }` — `messages` ascend,
 and each carries `seq`, `kind` (`chat` | `action` | `system`), `from`, `text`, `ts`.
+`olderCount` is roughly how many persisted messages sit below the returned page
+(0 when `hasMore` is false).
 
 History is **persistent**: it survives service restarts and outlives empty rooms, so
 `/history` and `since=0` can both reach messages written days earlier.
+
+**v3.4 — joins replay everything.** Socket.io joins (website, CLI, SSH) and SSE
+joins replay up to 1000 messages at once — for any realistic room that is the
+WHOLE log, so newcomers see the complete history immediately. The lazy path
+still exists for gigantic rooms: the `history` socket event / `before=` pages
+cover anything beyond the window, and every client offers a "load all" affordance
+(web banner button, `/history all` in CLI, SSH and the website input).
 
 ---
 

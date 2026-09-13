@@ -151,6 +151,9 @@ let earlyInput = '' // a line typed while still connecting — used as room (or 
 let histCursor: number | null = null
 let histHasMore = false
 let histLoading = false
+// v3.4 /history all: when true, each history-page that still reports hasMore
+// immediately requests the next page — dumps the whole persisted log.
+let histDumpAll = false
 
 const rl = readline.createInterface({
   input: process.stdin,
@@ -209,7 +212,7 @@ function askName() {
   })
 }
 
-function enterRoom(info: { you: string; room?: string; count: number; users: { name: string }[]; history: any[]; hasMore?: boolean }) {
+function enterRoom(info: { you: string; room?: string; count: number; users: { name: string }[]; history: any[]; hasMore?: boolean; olderCount?: number }) {
   state = 'chatting'
   myName = info.you
   myRoom = info.room || myRoom || DEFAULT_ROOM
@@ -222,11 +225,15 @@ function enterRoom(info: { you: string; room?: string; count: number; users: { n
   histCursor = hist.length && typeof hist[0]?.seq === 'number' ? hist[0].seq : null
   histHasMore = !!info.hasMore
   histLoading = false
+  histDumpAll = false
   if (hist.length) {
     console.log(`  ${DIM}—— recent messages ————${R}`)
     for (const m of hist) renderMessage(m)
     console.log(`  ${DIM}———————————————————————${R}`)
-    if (histHasMore) console.log(`  ${DIM}older messages on record — /history to load more${R}`)
+    if (histHasMore) {
+      const n = typeof info.olderCount === 'number' && info.olderCount > 0 ? info.olderCount : null
+      console.log(`  ${DIM}${n ? n + ' older message(s) on record — ' : 'older messages on record — '}/history to load more · /history all for everything${R}`)
+    }
     console.log('')
   }
   rl.setPrompt(`${GREEN}${BOLD}${info.you}${R} ${DIM}@${myRoom}${R} ${GREEN}>${R} `)
@@ -297,13 +304,20 @@ socket.on('history-page', (d: { messages?: any[]; hasMore?: boolean; before?: nu
   const page = Array.isArray(d?.messages) ? d.messages : []
   if (!page.length) {
     histHasMore = false
+    histDumpAll = false
     printLine(`  ${DIM}no older messages on record${R}`)
     return
   }
   if (typeof page[0]?.seq === 'number') histCursor = page[0].seq
   histHasMore = !!d.hasMore
   for (const m of page) renderMessage(m)
-  printLine(`  ${DIM}—— ${page.length} older message(s)${d.hasMore ? ' · /history for more' : ' · start of history'} ——${R}`)
+  if (histHasMore) {
+    printLine(`  ${DIM}—— ${page.length} older message(s) · /history for more${histDumpAll ? '' : ' · /history all for everything'} ——${R}`)
+    if (histDumpAll) socket.emit('history', { before: histCursor ?? undefined, limit: 200 })
+  } else {
+    histDumpAll = false
+    printLine(`  ${DIM}—— ${page.length} older message(s) · start of history ——${R}`)
+  }
 })
 
 socket.on('users-list', (data: { users: { name: string }[]; count: number }) => {
@@ -349,10 +363,11 @@ function handleCommand(line: string): boolean {
   switch ((cmd || '').toLowerCase()) {
     case 'help':
       printLine(`  ${DIM}/nick <name>  change name | /me <action>  emote | /users  who is here${R}`)
-      printLine(`  ${DIM}/rooms  list rooms | /history [n]  load older messages | /clear | /url | /quit${R}`)
+      printLine(`  ${DIM}/rooms  list rooms | /history [n|all]  load older messages | /clear | /url | /quit${R}`)
       return true
     case 'history': {
-      const n = Math.max(1, Math.min(parseInt(argStr, 10) || 30, 100))
+      const wantsAll = argStr.trim().toLowerCase() === 'all'
+      const n = wantsAll ? 200 : Math.max(1, Math.min(parseInt(argStr, 10) || 30, 1000))
       if (histLoading) {
         printLine(`  ${DIM}history page already in flight…${R}`)
         return true
@@ -362,6 +377,7 @@ function handleCommand(line: string): boolean {
         return true
       }
       histLoading = true
+      histDumpAll = wantsAll
       socket.emit('history', { before: histCursor ?? undefined, limit: n })
       return true
     }

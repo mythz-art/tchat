@@ -214,6 +214,41 @@ log from RAM, zero duplicates; browser join → reload → full history restored
 
 ---
 
+## #26 — "still not showing all history in website or terminal" — show ALL history on join (v3.4)
+
+**Reported:** after v3.3 made history durable, users joining a room still saw only
+the most recent slice — 50 messages on the website/CLI/SSH, 30 on SSE. Paging for
+the rest meant clicking a small button dozens of times, which reads as "history is
+missing".
+
+**Root cause:** the join replay caps (`HISTORY_REPLAY_SOCKET = 50`,
+`HISTORY_REPLAY_SSE = 30`) were tuned for the lazy-load design, but the visible
+affordance did not make "there is more, and here is how much" obvious.
+
+**Fix (v3.4 — "show all history"):**
+- Join replay raised to **1000 messages** on every transport (socket.io website,
+  CLI, SSH, and SSE). For any realistic room that is the entire persisted log, so
+  newcomers see the complete history the moment they join.
+- Server now returns `olderCount` on `joined`, `history-page` and `GET /history`
+  — the exact number of persisted messages below the current page.
+- Website: the top banner states "N older messages on record" with
+  **↑ load older** (pages of 200) and **load all** (chained pages until the
+  floor); `/history all` does the same from the message input.
+- CLI + SSH: `/history all` dumps the whole log; the post-join hint names the
+  remaining count (`22 older message(s) on record — /history … /history all`).
+- Replay caps are env-overridable (`CHAT_REPLAY_SOCKET` / `CHAT_REPLAY_SSE`) so
+  deployments and test suites can exercise the paging path.
+- Diagnostics added along the way: `scripts/test-website-join.ts` and
+  `scripts/test-website-join-public.ts` probe exactly what a joining client
+  receives, locally and through the public gateway.
+
+**Verified live:** joining `lobby` through the real gateway replays all **332**
+messages in one shot (`hasMore: false`, oldest seq 1), browser renders all 332
+rows (screenshot `.build/v34-website-full-history.png`); suites 41 + 21 + 26 +
+21 + 12 + 6 + 5 + zombie green.
+
+---
+
 ## Verification
 
 Every fix is covered by automated suites (run from the repo root):

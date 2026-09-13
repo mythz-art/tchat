@@ -71,10 +71,14 @@ const MAX_ROOM_LEN = 24
 const MAX_TEXT_LEN = 500
 // History (v3.1): everything is persisted to disk; RAM holds a generous window.
 const HISTORY_RAM = 2000 // in-RAM messages per room (older pages stream from disk)
-const HISTORY_REPLAY_SOCKET = 50 // recent messages replayed on socket.io join
-const HISTORY_REPLAY_SSE = 30 // recent messages replayed on SSE join
+// v3.4 "show all history": joins replay EVERYTHING a room realistically holds
+// (the cap only guards pathological payloads; socket.io maxPayload is 1MB and
+// 1000 * 500-char messages ≈ 500KB). Beyond the cap clients lazy-load pages.
+// Env-overridable so test suites can exercise the paging path with a small window.
+const HISTORY_REPLAY_SOCKET = Number(process.env.CHAT_REPLAY_SOCKET || 1000) // messages replayed on socket.io join
+const HISTORY_REPLAY_SSE = Number(process.env.CHAT_REPLAY_SSE || process.env.CHAT_REPLAY_SOCKET || 1000) // lines replayed on SSE join
 const HISTORY_PAGE_DEFAULT = 30 // page size when the client does not ask
-const HISTORY_PAGE_MAX = 100
+const HISTORY_PAGE_MAX = 1000 // v3.4: big pages so "load all" needs few round-trips
 
 // Polling API (v3.2): AI agents (and any HTTP client) can follow a room with
 // plain request/response polling instead of holding an SSE stream open —
@@ -417,7 +421,12 @@ function pageHistory(
     if (older.length) msgs = [...older, ...msgs]
   }
   const hasMore = msgs.length > 0 && (msgs[0]?.seq ?? 0) > roomMinSeq(room)
-  return { messages: msgs, hasMore }
+  // v3.4: how many persisted messages sit above the page floor (informational —
+  // seq gaps from healing/dedup make it approximate, never smaller than truth).
+  const olderCount = hasMore
+    ? Math.max(0, (msgs[0]?.seq ?? 0) - roomMinSeq(room))
+    : 0
+  return { messages: msgs, hasMore, olderCount }
 }
 
 /** Messages with seq > since (strictly newer), ascending, capped at `limit`.
@@ -619,6 +628,7 @@ io.on('connection', (socket: Socket) => {
       users: publicUsersIn(room),
       history: replay.messages,
       hasMore: replay.hasMore,
+      olderCount: replay.olderCount,
       lastSeq: room.seq,
     })
     console.log(`[join] ${user.name} @ ${room.label} (room=${room.users.size}, online=${totalOnline()})`)
@@ -709,6 +719,7 @@ io.on('connection', (socket: Socket) => {
       room: room.label,
       messages: page.messages,
       hasMore: page.hasMore,
+      olderCount: page.olderCount,
       lastSeq: room.seq,
       before: before ?? null,
     })
@@ -806,8 +817,7 @@ const bridge = createServer((req, res) => {
     const sseReplay = pageHistory(room, undefined, HISTORY_REPLAY_SSE)
     for (const m of sseReplay.messages) sseWrite(room, key, formatLine(m))
     if (sseReplay.hasMore) {
-      const older = Math.max(0, (sseReplay.messages[0]?.seq ?? room.seq + 1) - 1)
-      sseWrite(room, key, `*** ${older}+ older message(s) on record — send /history to load more`)
+      sseWrite(room, key, `*** ${sseReplay.olderCount} older message(s) on record — send /history to load more (or /history all)`)
     }
     emitPresence()
     console.log(`[sse-join] ${user.name} @ ${room.label} (room=${room.users.size}, online=${totalOnline()})`)
@@ -1148,7 +1158,14 @@ const bridge = createServer((req, res) => {
     }
     res.writeHead(200, { 'Content-Type': 'application/json' })
     res.end(
-      JSON.stringify({ ok: true, room: roomLabel, messages: page.messages, hasMore: page.hasMore, lastSeq: room.seq })
+      JSON.stringify({
+        ok: true,
+        room: roomLabel,
+        messages: page.messages,
+        hasMore: page.hasMore,
+        olderCount: page.olderCount,
+        lastSeq: room.seq,
+      })
     )
     return
   }

@@ -6974,6 +6974,7 @@ var earlyInput = "";
 var histCursor = null;
 var histHasMore = false;
 var histLoading = false;
+var histDumpAll = false;
 var rl = readline.createInterface({
   input: process.stdin,
   output: process.stdout,
@@ -7040,13 +7041,16 @@ function enterRoom(info) {
   histCursor = hist.length && typeof hist[0]?.seq === "number" ? hist[0].seq : null;
   histHasMore = !!info.hasMore;
   histLoading = false;
+  histDumpAll = false;
   if (hist.length) {
     console.log(`  ${DIM}—— recent messages ————${R}`);
     for (const m of hist)
       renderMessage(m);
     console.log(`  ${DIM}———————————————————————${R}`);
-    if (histHasMore)
-      console.log(`  ${DIM}older messages on record — /history to load more${R}`);
+    if (histHasMore) {
+      const n = typeof info.olderCount === "number" && info.olderCount > 0 ? info.olderCount : null;
+      console.log(`  ${DIM}${n ? n + " older message(s) on record — " : "older messages on record — "}/history to load more · /history all for everything${R}`);
+    }
     console.log("");
   }
   rl.setPrompt(`${GREEN}${BOLD}${info.you}${R} ${DIM}@${myRoom}${R} ${GREEN}>${R} `);
@@ -7108,6 +7112,7 @@ socket.on("history-page", (d) => {
   const page = Array.isArray(d?.messages) ? d.messages : [];
   if (!page.length) {
     histHasMore = false;
+    histDumpAll = false;
     printLine(`  ${DIM}no older messages on record${R}`);
     return;
   }
@@ -7116,7 +7121,14 @@ socket.on("history-page", (d) => {
   histHasMore = !!d.hasMore;
   for (const m of page)
     renderMessage(m);
-  printLine(`  ${DIM}—— ${page.length} older message(s)${d.hasMore ? " · /history for more" : " · start of history"} ——${R}`);
+  if (histHasMore) {
+    printLine(`  ${DIM}—— ${page.length} older message(s) · /history for more${histDumpAll ? "" : " · /history all for everything"} ——${R}`);
+    if (histDumpAll)
+      socket.emit("history", { before: histCursor ?? undefined, limit: 200 });
+  } else {
+    histDumpAll = false;
+    printLine(`  ${DIM}—— ${page.length} older message(s) · start of history ——${R}`);
+  }
 });
 socket.on("users-list", (data) => {
   const names = data.users.map((u) => u.name).join(", ") || "(nobody)";
@@ -7154,10 +7166,11 @@ function handleCommand(line) {
   switch ((cmd || "").toLowerCase()) {
     case "help":
       printLine(`  ${DIM}/nick <name>  change name | /me <action>  emote | /users  who is here${R}`);
-      printLine(`  ${DIM}/rooms  list rooms | /history [n]  load older messages | /clear | /url | /quit${R}`);
+      printLine(`  ${DIM}/rooms  list rooms | /history [n|all]  load older messages | /clear | /url | /quit${R}`);
       return true;
     case "history": {
-      const n = Math.max(1, Math.min(parseInt(argStr, 10) || 30, 100));
+      const wantsAll = argStr.trim().toLowerCase() === "all";
+      const n = wantsAll ? 200 : Math.max(1, Math.min(parseInt(argStr, 10) || 30, 1000));
       if (histLoading) {
         printLine(`  ${DIM}history page already in flight…${R}`);
         return true;
@@ -7167,6 +7180,7 @@ function handleCommand(line) {
         return true;
       }
       histLoading = true;
+      histDumpAll = wantsAll;
       socket.emit("history", { before: histCursor ?? undefined, limit: n });
       return true;
     }

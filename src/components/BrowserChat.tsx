@@ -125,6 +125,10 @@ export default function BrowserChat({
 
   const [messages, setMessages] = useState<RoomMessage[]>([]);
   const [hasMoreHistory, setHasMoreHistory] = useState(false);
+  // v3.4: how many persisted messages sit OLDER than what we hold — the
+  // banner states the number so "there is more history" is never a guess.
+  const [olderCount, setOlderCount] = useState(0);
+  const olderCountRef = useRef(0);
   const [room, setRoom] = useState(initialRoom);
   const [webName, setWebName] = useState('');
   const [myName, setMyName] = useState('');
@@ -152,6 +156,9 @@ export default function BrowserChat({
   const loadingHistoryRef = useRef(false);
   const scrollRestoreRef = useRef<{ h: number; top: number } | null>(null);
   const atBottomRef = useRef(true);
+  // v3.4 "load all": when true, every history-page that still reports hasMore
+  // immediately requests the next page — one click walks the whole log.
+  const loadAllRef = useRef(false);
   // Dedupe ledger: mount-only socket handlers cannot read fresh `messages`, so
   // ids of every ingested message (live or replayed) live here instead.
   const seenIdsRef = useRef<Set<string>>(new Set());
@@ -209,20 +216,30 @@ export default function BrowserChat({
       setMessages(prev => [...prev.slice(-399), m]);
       if (joinedRef.current) socket.emit('users');
     });
-    socket.on('history-page', (d: { room?: string; messages?: RoomMessage[]; hasMore?: boolean }) => {
+    socket.on('history-page', (d: { room?: string; messages?: RoomMessage[]; hasMore?: boolean; olderCount?: number }) => {
       loadingHistoryRef.current = false;
       const seen = seenIdsRef.current;
       const page = (d.messages || []).filter(m => m && typeof m.seq === 'number' && m.id && !seen.has(m.id));
       hasMoreRef.current = !!d.hasMore;
       setHasMoreHistory(!!d.hasMore);
-      if (!page.length) return;
+      olderCountRef.current = typeof d.olderCount === 'number' ? d.olderCount : olderCountRef.current;
+      setOlderCount(olderCountRef.current);
+      if (!page.length) {
+        if (loadAllRef.current && !hasMoreRef.current) loadAllRef.current = false;
+        return;
+      }
       for (const m of page) seen.add(m.id);
       if (typeof page[0].seq === 'number') oldestSeqRef.current = page[0].seq;
       const el = logRef.current;
       if (el) scrollRestoreRef.current = { h: el.scrollHeight, top: el.scrollTop };
-      setMessages(prev => [...page, ...prev].slice(-799));
+      setMessages(prev => [...page, ...prev].slice(-3000));
+      // load-all chaining: keep walking until the server says the floor is reached
+      if (loadAllRef.current) {
+        if (hasMoreRef.current) loadOlderRef.current();
+        else loadAllRef.current = false;
+      }
     });
-    socket.on('joined', (d: { you: string; room?: string; count: number; users: { name: string }[]; history: RoomMessage[]; hasMore?: boolean; lastSeq?: number }) => {
+    socket.on('joined', (d: { you: string; room?: string; count: number; users: { name: string }[]; history: RoomMessage[]; hasMore?: boolean; olderCount?: number; lastSeq?: number }) => {
         setMyName(d.you);
         const r = d.room || room || 'lobby';
         setJoinedRoom(r);
@@ -242,6 +259,9 @@ export default function BrowserChat({
         loadingHistoryRef.current = false;
         hasMoreRef.current = !!d.hasMore;
         setHasMoreHistory(!!d.hasMore);
+        olderCountRef.current = typeof d.olderCount === 'number' ? d.olderCount : 0;
+        setOlderCount(olderCountRef.current);
+        loadAllRef.current = false;
         scrollRestoreRef.current = null;
         atBottomRef.current = true;
         // Joined from the homepage card: sync the URL to /r/<room> WITHOUT
@@ -391,9 +411,19 @@ export default function BrowserChat({
     const sock = socketRef.current;
     if (!sock || loadingHistoryRef.current || !hasMoreRef.current) return;
     loadingHistoryRef.current = true;
-    sock.emit('history', { before: oldestSeqRef.current ?? undefined, limit: 30 });
+    sock.emit('history', { before: oldestSeqRef.current ?? undefined, limit: 200 });
   }, []);
   const loadOlderRef = useRef(loadOlder);
+  // v3.4: one click = walk the ENTIRE persisted log (pages of 200 until the
+  // server reports hasMore:false; the history-page handler does the chaining).
+  const startLoadAll = useCallback(() => {
+    const sock = socketRef.current;
+    if (!sock || !hasMoreRef.current || loadingHistoryRef.current) return;
+    loadAllRef.current = true;
+    loadingHistoryRef.current = true;
+    sock.emit('history', { before: oldestSeqRef.current ?? undefined, limit: 200 });
+  }, []);
+  const startLoadAllRef = useRef(startLoadAll);
   // hasMore lives in a ref (mirrored at the same ingestion points as the
   // state below) so the scroll handler always sees the latest value without
   // re-binding onScroll on every state flip.
@@ -462,7 +492,7 @@ export default function BrowserChat({
         setMessages(prev => [...prev.slice(-199), { id: localId(), kind: 'system' as const, subtype: 'local', text, ts: Date.now() }]);
       switch ((cmd || '').toLowerCase()) {
         case 'help':
-          local('commands: /nick <name> · /me <action> · /users · /rooms · /history <n> · /clear · /url · /help · /quit');
+          local('commands: /nick <name> · /me <action> · /users · /rooms · /history [n|all] · /clear · /url · /help · /quit');
           return true;
         case 'me':
           if (!arg) {
@@ -489,11 +519,28 @@ export default function BrowserChat({
         case 'clear':
           setMessages([]);
           return true;
-        case 'history':
+        case 'history': {
           if (!sock) return true;
+          const harg = arg.toLowerCase();
+          if (harg === 'all') {
+            if (!hasMoreRef.current) {
+              local('no older messages on record for this room');
+            } else {
+              local(`loading full history (${olderCountRef.current || 'remaining'} older message(s))…`);
+              startLoadAllRef.current();
+            }
+            return true;
+          }
+          const n = Number(harg);
+          if (Number.isFinite(n) && n > 0 && hasMoreRef.current && !loadingHistoryRef.current) {
+            loadingHistoryRef.current = true;
+            sock.emit('history', { before: oldestSeqRef.current ?? undefined, limit: Math.min(Math.floor(n), 1000) });
+            return true;
+          }
           loadOlderRef.current();
           if (!hasMoreRef.current) local('no older messages on record for this room');
           return true;
+        }
         case 'url':
           local(`server: tchat.space-z.ai · room: ${joinedRoom || room || 'lobby'} · web transport: socket.io`);
           return true;
@@ -618,13 +665,23 @@ export default function BrowserChat({
             className={`rounded-lg border border-zinc-800 bg-zinc-950 p-3 ${height} overflow-y-auto font-mono text-[13px] leading-relaxed space-y-1 [scrollbar-color:#3f3f46_transparent]`}
           >
             {hasMoreHistory && (
-              <div className="flex justify-center pb-1">
+              <div className="flex items-center justify-center gap-2 pb-1 flex-wrap">
+                <span className="text-[11px] font-mono text-zinc-500">
+                  {olderCount > 0 ? `${olderCount} older message${olderCount === 1 ? '' : 's'} on record` : 'older messages on record'}
+                </span>
                 <button
                   type="button"
                   onClick={loadOlder}
                   className="text-[11px] font-mono text-emerald-400 border border-emerald-500/30 rounded-full px-3 py-0.5 hover:bg-emerald-500/10 transition-colors"
                 >
-                  ↑ load older messages
+                  ↑ load older
+                </button>
+                <button
+                  type="button"
+                  onClick={startLoadAll}
+                  className="text-[11px] font-mono text-zinc-400 hover:text-emerald-400 underline underline-offset-2 transition-colors"
+                >
+                  load all
                 </button>
               </div>
             )}

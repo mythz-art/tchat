@@ -95,7 +95,7 @@ function startService() {
   // process, and kill(9) on the wrapper orphans the real listener.
   child = spawn('bun', ['index.ts'], {
     cwd: join(process.cwd(), 'mini-services', 'chat-service'),
-    env: { ...process.env, CHAT_SERVICE_PORT: String(PORT_IO), CHAT_BRIDGE_PORT: String(PORT_BRIDGE), CHAT_HISTORY_DIR: HIST_DIR },
+    env: { ...process.env, CHAT_SERVICE_PORT: String(PORT_IO), CHAT_BRIDGE_PORT: String(PORT_BRIDGE), CHAT_HISTORY_DIR: HIST_DIR, CHAT_REPLAY_SOCKET: '50', CHAT_REPLAY_SSE: '50' },
     stdio: ['ignore', 'pipe', 'pipe'],
   })
 }
